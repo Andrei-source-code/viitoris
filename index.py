@@ -19,6 +19,11 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODELE_GEMINI = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-flash-latest",
                              "gemini-2.5-flash", "gemini-3.5-flash"] if m]
 
+# Google Maps (Places API New) - sursa principală pentru competitori
+GOOGLE_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+# GOOGLE_RATINGS=1 adaugă rating + nr. recenzii (SKU mai scump la Google)
+GOOGLE_RATINGS = os.environ.get("GOOGLE_RATINGS") == "1"
+
 # Groq rămâne ca rezervă, doar dacă ai setat GROQ_API_KEY
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 try:
@@ -126,7 +131,7 @@ LIMITA_ELEMENTE = 2000
 DISCLAIMER = ("Analiza este orientativă și NU garantează succesul afacerii. "
               "Rezultatul real depinde de locația exactă, de execuție și management, "
               "de calitatea produselor sau serviciilor și de condițiile pieței. "
-              "Numărul și lista competitorilor provin din OpenStreetMap și pot fi incomplete.")
+              "Numărul și lista competitorilor provin din harta folosită ca sursă și pot fi incomplete.")
 
 # cheie -> (cuvinte cheie, filtre OpenStreetMap)
 # ORDINEA CONTEAZĂ: "salon" înaintea lui "bar" (ca "barber" să nu fie bar)
@@ -255,7 +260,8 @@ def proceseaza_elemente(elements, centru):
         strada = (tags.get("addr:street") or "").strip()
         nr = (tags.get("addr:housenumber") or "").strip()
         adresa = (f"{strada} {nr}".strip() or tags.get("addr:full") or "").strip()
-        item = {"nume": nume, "adresa": adresa, "distanta_km": None, "link": None}
+        item = {"nume": nume, "adresa": adresa, "distanta_km": None, "link": None,
+                "lat": lat, "lon": lon}
         if lat is not None and lon is not None:
             item["link"] = (f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}"
                             f"#map=18/{lat:.6f}/{lon:.6f}")
@@ -267,7 +273,7 @@ def proceseaza_elemente(elements, centru):
     else:
         lista.sort(key=lambda x: x["nume"].lower())
     return {"total": total, "fara_nume": fara_nume, "lista": lista[:20],
-            "plafonat": len(elements) >= LIMITA_ELEMENTE}
+            "plafonat": len(elements) >= LIMITA_ELEMENTE, "sursa": "OpenStreetMap"}
 
 
 def gaseste_competitori(oras, cheie, geo, deadline):
@@ -294,8 +300,113 @@ def gaseste_competitori(oras, cheie, geo, deadline):
     return proceseaza_elemente(elemente, centru)
 
 
+# ---------------------------------------------------------- Google Maps (Places)
+TERMENI_GOOGLE = {
+    "cafenea": ("cafenea", "cafe"),
+    "restaurant": ("restaurant", "restaurant"),
+    "salon": ("salon de înfrumusețare frizerie coafor", None),
+    "patiserie": ("patiserie brutărie", "bakery"),
+    "fitness": ("sală de fitness", "gym"),
+    "bar": ("bar pub", "bar"),
+    "stomatologie": ("cabinet stomatologic", "dentist"),
+    "farmacie": ("farmacie", "pharmacy"),
+    "service_auto": ("service auto", "car_repair"),
+}
+RAZA_MAXIMA_KM = 15
+PAGINI_GOOGLE = 3  # 3 x 20 = maximum 60 de rezultate
+
+
+def gaseste_competitori_google(oras, tip_afacere, cheie, geo, deadline):
+    """Returnează (dict | None, eroare). Folosește Places API (New) - Text Search."""
+    if not GOOGLE_API_KEY:
+        return None, "GOOGLE_MAPS_API_KEY nu este setată"
+    termen, tip_inclus = TERMENI_GOOGLE.get(cheie, (tip_afacere, None))
+    corp = {"textQuery": f"{termen} în {oras}, România",
+            "languageCode": "ro", "regionCode": "RO", "pageSize": 20}
+    if tip_inclus:
+        corp["includedType"] = tip_inclus
+    if geo:
+        corp["locationBias"] = {"circle": {
+            "center": {"latitude": geo["lat"], "longitude": geo["lon"]},
+            "radius": 10000.0}}
+    campuri = ("nextPageToken,places.id,places.displayName,places.formattedAddress,"
+               "places.location,places.googleMapsUri")
+    if GOOGLE_RATINGS:
+        campuri += ",places.rating,places.userRatingCount"
+
+    locuri, token, eroare = [], None, ""
+    for _ in range(PAGINI_GOOGLE):
+        ramas = deadline - time.time()
+        if ramas < 4:
+            break
+        if token:
+            corp["pageToken"] = token
+        try:
+            r = requests.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers={"X-Goog-Api-Key": GOOGLE_API_KEY,
+                         "X-Goog-FieldMask": campuri,
+                         "Content-Type": "application/json"},
+                json=corp, timeout=min(10, ramas))
+        except Exception as e:
+            eroare = str(e)[:140]
+            break
+        if r.status_code != 200:
+            eroare = f"HTTP {r.status_code} {r.text[:200]}".replace("\n", " ")
+            break
+        js = r.json()
+        locuri += js.get("places", [])
+        token = js.get("nextPageToken")
+        if not token:
+            break
+    if eroare and not locuri:
+        return None, eroare
+
+    centru = (geo["lat"], geo["lon"]) if geo else None
+    vazute, lista = set(), []
+    for pl in locuri:
+        pid = pl.get("id") or id(pl)
+        if pid in vazute:
+            continue
+        vazute.add(pid)
+        loc = pl.get("location") or {}
+        lat, lon = loc.get("latitude"), loc.get("longitude")
+        dist = None
+        if centru and lat is not None and lon is not None:
+            dist = round(distanta_km(centru[0], centru[1], lat, lon), 1)
+            if dist > RAZA_MAXIMA_KM:
+                continue  # în afara orașului
+        lista.append({
+            "nume": ((pl.get("displayName") or {}).get("text") or "Fără nume").strip(),
+            "adresa": (pl.get("formattedAddress") or "").replace(", România", "").strip(),
+            "distanta_km": dist,
+            "link": pl.get("googleMapsUri"),
+            "lat": lat, "lon": lon,
+            "rating": pl.get("rating"),
+            "nr_recenzii": pl.get("userRatingCount"),
+        })
+    if centru:
+        lista.sort(key=lambda x: (x["distanta_km"] is None, x["distanta_km"] or 0))
+    return {"total": len(lista), "fara_nume": 0, "lista": lista[:20],
+            "plafonat": len(locuri) >= 20 * PAGINI_GOOGLE and bool(token),
+            "sursa": "Google Maps"}, ""
+
+
+def gaseste_competitori_automat(oras, tip_afacere, cheie, geo, deadline):
+    """Google Maps întâi, apoi OpenStreetMap ca rezervă. Returnează (comp, diagnostic)."""
+    diag = []
+    comp, eroare = gaseste_competitori_google(oras, tip_afacere, cheie, geo, deadline)
+    if comp is not None:
+        return comp, ""
+    diag.append(f"google: {eroare}")
+    comp = gaseste_competitori(oras, cheie, geo, deadline)
+    if comp is None:
+        diag.append("osm: fără răspuns" if cheie else "osm: tip necunoscut")
+    return comp, " | ".join(diag)
+
+
 # ---------------------------------------------------------------- evaluare
-def evalueaza(buget, buget_min, competitori, populatie):
+def evalueaza(buget, buget_min, competitori, populatie, sursa="OpenStreetMap"):
     """Nivel de risc calculat de cod (determinist). AI-ul îl explică."""
     scor = 0
     raport_buget = None
@@ -315,22 +426,26 @@ def evalueaza(buget, buget_min, competitori, populatie):
         if populatie and populatie > 0:
             densitate = competitori / (populatie / 10000.0)
             if densitate <= 3:
-                scor += 2
+                sc = 2
             elif densitate <= 6:
-                scor += 1
+                sc = 1
             elif densitate <= 10:
-                scor -= 1
+                sc = -1
             else:
-                scor -= 2
+                sc = -2
         else:
             if competitori <= 10:
-                scor += 2
+                sc = 2
             elif competitori <= 30:
-                scor += 1
+                sc = 1
             elif competitori <= 80:
-                scor -= 1
+                sc = -1
             else:
-                scor -= 2
+                sc = -2
+        # OpenStreetMap e adesea incomplet: puțini competitori nu înseamnă piață liberă
+        if sursa != "Google Maps":
+            sc = min(sc, 1)
+        scor += sc
 
     if scor >= 3:
         nivel, titlu = "bun", "FEZABIL – ȘANSE BUNE"
@@ -417,9 +532,12 @@ def construieste_prompt(oras, tip, buget, buget_min, sursa, comp, ev):
         linie_comp = "Numărul de competitori NU a putut fi determinat (nu inventa o cifră)."
         exemple = "(listă indisponibilă)"
     else:
-        linie_comp = (f"Pe harta OpenStreetMap au fost găsite {comp['total']} locații similare"
-                      f"{' (limită atinsă, numărul real poate fi mai mare)' if comp['plafonat'] else ''}, "
-                      f"dintre care {comp['fara_nume']} fără nume înregistrat.")
+        linie_comp = (f"Pe {comp['sursa']} au fost găsite {comp['total']} locații similare"
+                      f"{' (limită atinsă, numărul real poate fi mai mare)' if comp['plafonat'] else ''}"
+                      f"{', dintre care ' + str(comp['fara_nume']) + ' fără nume înregistrat' if comp['fara_nume'] else ''}.")
+        if comp["sursa"] != "Google Maps":
+            linie_comp += (" Datele OpenStreetMap sunt adesea incomplete în orașele mici, "
+                           "deci numărul real e probabil mai mare.")
         if ev["densitate"] is not None:
             linie_comp += f" Densitate: aprox. {ev['densitate']:.1f} la 10.000 locuitori."
         rand = []
@@ -429,6 +547,8 @@ def construieste_prompt(oras, tip, buget, buget_min, sursa, comp, ev):
                 parti.append(c["adresa"])
             if c["distanta_km"] is not None:
                 parti.append(f"~{c['distanta_km']} km de centru")
+            if c.get("rating"):
+                parti.append(f"rating {c['rating']} ({c.get('nr_recenzii') or 0} recenzii)")
             rand.append("- " + ", ".join(parti))
         exemple = "\n".join(rand) or "(niciun competitor cu nume)"
     linie_min = (f"Buget minim orientativ pentru acest tip de afacere: {buget_min} EUR "
@@ -548,7 +668,7 @@ def raport_rezerva(ev, oras, tip, buget, buget_min, comp):
                 f"Verificați manual pe Google Maps câte locații de tip „{tip}” există în {oras}, "
                 "vizitați-le și notați prețurile, programul și gradul de aglomerare.")
     else:
-        conc = f"Pe harta OpenStreetMap apar {comp['total']} locații similare în {oras}."
+        conc = f"Pe harta ({comp['sursa']}) apar {comp['total']} locații similare în {oras}."
         if ev["densitate"] is not None:
             conc += f" Asta înseamnă aproximativ {ev['densitate']:.1f} la 10.000 de locuitori."
         nume = [c["nume"] for c in comp["lista"][:5]]
@@ -636,6 +756,7 @@ def health():
         'status': 'ok',
         'cariere_incarcate': df_cariere is not None,
         'gemini_configurat': GEMINI_API_KEY is not None,
+        'google_maps_configurat': GOOGLE_API_KEY is not None,
         'groq_configurat': client is not None,
     })
 
@@ -657,12 +778,13 @@ def test_ai():
 def test_harta():
     """Ex: /test-harta?oras=Bacău&tip=cafenea"""
     oras = request.args.get('oras', 'Bacău')
-    cheie = detecteaza_tip(request.args.get('tip', 'cafenea'))
+    tip = request.args.get('tip', 'cafenea')
+    cheie = detecteaza_tip(tip)
     geo = geocodeaza_oras(oras)
-    comp = gaseste_competitori(oras, cheie, geo, time.time() + 25)
-    return jsonify({'tip_detectat': cheie, 'geocodare': geo,
-                    'competitori': comp and {'total': comp['total'],
-                                             'fara_nume': comp['fara_nume'],
+    comp, diag = gaseste_competitori_automat(oras, tip, cheie, geo, time.time() + 25)
+    return jsonify({'tip_detectat': cheie, 'geocodare': geo, 'diagnostic': diag,
+                    'competitori': comp and {'sursa': comp['sursa'], 'total': comp['total'],
+                                             'plafonat': comp['plafonat'],
                                              'primii_5': comp['lista'][:5]}})
 
 
@@ -683,11 +805,12 @@ def analizeaza_business_live():
     cheie = detecteaza_tip(tip_afacere)
     buget_min, nume_oficial, sursa = buget_minim_pentru(cheie)
 
-    geo = geocodeaza_oras(oras) if cheie else None
-    comp = gaseste_competitori(oras, cheie, geo, start + 28)
+    geo = geocodeaza_oras(oras)
+    comp, diag_harta = gaseste_competitori_automat(oras, tip_afacere, cheie, geo, start + 28)
     total = comp["total"] if comp else None
     populatie = geo["populatie"] if geo else None
-    ev = evalueaza(buget, buget_min, total, populatie)
+    ev = evalueaza(buget, buget_min, total, populatie,
+                   comp["sursa"] if comp else "OpenStreetMap")
 
     raport, diag = None, ""
     if GEMINI_API_KEY or client is not None:
@@ -709,6 +832,9 @@ def analizeaza_business_live():
         'buget': buget,
         'buget_minim': buget_min,
         'raport_buget': round(ev['raport_buget'], 2) if ev['raport_buget'] else None,
+        'centru': {'lat': geo['lat'], 'lon': geo['lon']} if geo else None,
+        'sursa_competitori': comp['sursa'] if comp else None,
+        'harta_diagnostic': diag_harta,
         'competitori_gasiti': total,
         'competitori_lista': comp["lista"] if comp else [],
         'competitori_fara_nume': comp["fara_nume"] if comp else 0,
