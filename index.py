@@ -1,5 +1,8 @@
 import os
+import re
 import json
+import math
+import time
 import unicodedata
 
 import requests
@@ -13,8 +16,8 @@ CORS(app)
 # ---------------------------------------------------------------- configurare
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # Poți fixa modelul din Vercel (variabila GEMINI_MODEL); altfel se încearcă pe rând
-MODELE_GEMINI = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-3.5-flash",
-                             "gemini-2.5-flash", "gemini-flash-latest"] if m]
+MODELE_GEMINI = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-flash-latest",
+                             "gemini-2.5-flash", "gemini-3.5-flash"] if m]
 
 # Groq rămâne ca rezervă, doar dacă ai setat GROQ_API_KEY
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -112,6 +115,19 @@ def calculeaza_punctaje(data):
 
 
 # --------------------------------------------------------- partea ANTREPRENOR
+UA = "viitoris-business-analyzer/2.0 (proiect educational Viitoris)"
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+LIMITA_ELEMENTE = 2000
+
+DISCLAIMER = ("Analiza este orientativă și NU garantează succesul afacerii. "
+              "Rezultatul real depinde de locația exactă, de execuție și management, "
+              "de calitatea produselor sau serviciilor și de condițiile pieței. "
+              "Numărul și lista competitorilor provin din OpenStreetMap și pot fi incomplete.")
+
 # cheie -> (cuvinte cheie, filtre OpenStreetMap)
 # ORDINEA CONTEAZĂ: "salon" înaintea lui "bar" (ca "barber" să nu fie bar)
 TIPURI = {
@@ -128,12 +144,21 @@ TIPURI = {
                 ['["leisure"="fitness_centre"]']),
     "bar": (["bar", "pub", "club"],
             ['["amenity"~"^(bar|pub|nightclub)$"]']),
-    # fără buget minim în JSON, dar cu căutare pe hartă
     "stomatologie": (["stomatolog", "dentar", "dentist"], ['["amenity"="dentist"]']),
     "farmacie": (["farmacie"], ['["amenity"="pharmacy"]']),
     "service_auto": (["service auto", "auto", "vulcaniz", "service"],
                      ['["shop"="car_repair"]']),
 }
+
+ALOCARE_IMPLICITA = [
+    ("Amenajare și adaptare spațiu", 22, "Renovări, mobilier, instalații, firmă și semnalistică."),
+    ("Echipamente și dotări", 28, "Echipamentele principale necesare activității zilnice."),
+    ("Stoc inițial și materiale", 10, "Prima aprovizionare și consumabile."),
+    ("Autorizări, avize și juridic", 5, "Înființare firmă, avize sanitare/ISU, contabil."),
+    ("Marketing și lansare", 10, "Rețele sociale, materiale, promoții de deschidere."),
+    ("Personal și cheltuieli curente (primele luni)", 15, "Chirie, utilități, salarii până la stabilizarea încasărilor."),
+    ("Fond de rezervă", 10, "Pentru costuri neprevăzute și lunile slabe de început."),
+]
 
 
 def detecteaza_tip(tip_afacere):
@@ -153,127 +178,420 @@ def buget_minim_pentru(cheie):
     return loc.get("buget_minim_necesar"), info.get("nume"), loc.get("sursa_informatii")
 
 
-def numara_competitori_live(oras, cheie):
-    """Număr de afaceri similare din oraș (OpenStreetMap). None dacă nu se poate."""
-    if not cheie:
-        return None
-    filtre = TIPURI[cheie][1]
-    oras_safe = oras.replace('"', '').replace('\\', '')
-    interogari = "\n".join(f"nwr{f}(area.a);" for f in filtre)
-    query = f"""
-    [out:json][timeout:15];
-    area["name"="{oras_safe}"]["boundary"="administrative"]->.a;
-    (
-      {interogari}
-    );
-    out count;
-    """
+# ------------------------------------------------------- competitori (hartă)
+def geocodeaza_oras(oras):
+    """Centru, bounding box și populație (dacă există) din Nominatim."""
     try:
-        r = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data={'data': query},
-            headers={'User-Agent': 'viitoris-business-analyzer/1.0'},
-            timeout=18,
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": oras, "format": "json", "limit": 1,
+                    "countrycodes": "ro", "extratags": 1},
+            headers={"User-Agent": UA, "Accept-Language": "ro"},
+            timeout=8,
         )
         r.raise_for_status()
-        elements = r.json().get('elements', [])
-        if elements:
-            return int(elements[0].get('tags', {}).get('total', 0))
-        return 0
+        rez = r.json()
+        if not rez:
+            return None
+        x = rez[0]
+        lat, lon = float(x["lat"]), float(x["lon"])
+        s, n, w, e = [float(v) for v in x["boundingbox"]]
+        # dacă zona e uriașă (ex. județ), o restrângem în jurul centrului
+        if (n - s) > 0.5 or (e - w) > 0.7:
+            s, n, w, e = lat - 0.08, lat + 0.08, lon - 0.12, lon + 0.12
+        pop = None
+        p = (x.get("extratags") or {}).get("population")
+        if p:
+            primul = re.split(r"[;\s]", str(p).strip())[0]
+            cifre = re.sub(r"\D", "", primul)
+            pop = int(cifre) if cifre else None
+        return {"lat": lat, "lon": lon, "bbox": (s, w, n, e), "populatie": pop}
     except Exception as e:
-        print(f"Avertisment Overpass: {e}")
+        print(f"Avertisment Nominatim: {e}")
         return None
 
 
-def evalueaza(buget, buget_min, competitori):
-    """Verdict calculat de cod (determinist). AI-ul doar îl explică."""
+def ruleaza_overpass(query, deadline):
+    for url in OVERPASS_URLS:
+        ramas = deadline - time.time()
+        if ramas < 4:
+            break
+        try:
+            r = requests.post(url, data={"data": query},
+                              headers={"User-Agent": UA}, timeout=min(14, ramas))
+            if r.status_code != 200:
+                print(f"Overpass {url}: HTTP {r.status_code}")
+                continue
+            return r.json().get("elements", [])
+        except Exception as e:
+            print(f"Overpass {url}: {e}")
+    return None
+
+
+def distanta_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def proceseaza_elemente(elements, centru):
+    vazute, lista, total, fara_nume = set(), [], 0, 0
+    for el in elements:
+        tags = el.get("tags") or {}
+        lat = el.get("lat", (el.get("center") or {}).get("lat"))
+        lon = el.get("lon", (el.get("center") or {}).get("lon"))
+        nume = (tags.get("name") or tags.get("brand") or tags.get("operator") or "").strip()
+        if lat is not None and lon is not None:
+            k = (nume.lower(), round(lat, 3), round(lon, 3))
+            if k in vazute:
+                continue
+            vazute.add(k)
+        total += 1
+        if not nume:
+            fara_nume += 1
+            continue
+        strada = (tags.get("addr:street") or "").strip()
+        nr = (tags.get("addr:housenumber") or "").strip()
+        adresa = (f"{strada} {nr}".strip() or tags.get("addr:full") or "").strip()
+        item = {"nume": nume, "adresa": adresa, "distanta_km": None, "link": None}
+        if lat is not None and lon is not None:
+            item["link"] = (f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}"
+                            f"#map=18/{lat:.6f}/{lon:.6f}")
+            if centru:
+                item["distanta_km"] = round(distanta_km(centru[0], centru[1], lat, lon), 1)
+        lista.append(item)
+    if centru:
+        lista.sort(key=lambda x: (x["distanta_km"] is None, x["distanta_km"] or 0))
+    else:
+        lista.sort(key=lambda x: x["nume"].lower())
+    return {"total": total, "fara_nume": fara_nume, "lista": lista[:20],
+            "plafonat": len(elements) >= LIMITA_ELEMENTE}
+
+
+def gaseste_competitori(oras, cheie, geo, deadline):
+    """Returnează dict cu total + listă, sau None dacă harta nu a răspuns."""
+    if not cheie:
+        return None
+    uniune = "\n".join(f"nwr{f}{{FILTRU_ZONA}};" for f in TIPURI[cheie][1])
+    if geo:
+        s, w, n, e = geo["bbox"]
+        zona = f"({s:.5f},{w:.5f},{n:.5f},{e:.5f})"
+        query = (f"[out:json][timeout:25];\n(\n{uniune.replace('{FILTRU_ZONA}', zona)}\n);\n"
+                 f"out center tags {LIMITA_ELEMENTE};")
+        centru = (geo["lat"], geo["lon"])
+    else:
+        oras_safe = oras.replace('"', '').replace('\\', '')
+        query = (f"[out:json][timeout:25];\n"
+                 f"area[\"name\"=\"{oras_safe}\"][\"boundary\"=\"administrative\"]->.a;\n(\n"
+                 f"{uniune.replace('{FILTRU_ZONA}', '(area.a)')}\n);\n"
+                 f"out center tags {LIMITA_ELEMENTE};")
+        centru = None
+    elemente = ruleaza_overpass(query, deadline)
+    if elemente is None:
+        return None
+    return proceseaza_elemente(elemente, centru)
+
+
+# ---------------------------------------------------------------- evaluare
+def evalueaza(buget, buget_min, competitori, populatie):
+    """Nivel de risc calculat de cod (determinist). AI-ul îl explică."""
     scor = 0
+    raport_buget = None
     if buget_min:
-        raport = buget / buget_min
-        if raport >= 1.5:
+        raport_buget = buget / buget_min
+        if raport_buget >= 1.5:
             scor += 2
-        elif raport >= 1:
+        elif raport_buget >= 1:
             scor += 1
-        elif raport >= 0.7:
+        elif raport_buget >= 0.7:
             scor -= 1
         else:
             scor -= 3
+
+    densitate = None
     if competitori is not None:
-        if competitori <= 10:
-            scor += 2
-        elif competitori <= 30:
-            scor += 1
-        elif competitori <= 60:
-            scor -= 1
+        if populatie and populatie > 0:
+            densitate = competitori / (populatie / 10000.0)
+            if densitate <= 3:
+                scor += 2
+            elif densitate <= 6:
+                scor += 1
+            elif densitate <= 10:
+                scor -= 1
+            else:
+                scor -= 2
         else:
-            scor -= 2
-    return ("REUȘITĂ" if scor >= 1 else "EȘEC"), scor
+            if competitori <= 10:
+                scor += 2
+            elif competitori <= 30:
+                scor += 1
+            elif competitori <= 80:
+                scor -= 1
+            else:
+                scor -= 2
+
+    if scor >= 3:
+        nivel, titlu = "bun", "FEZABIL – ȘANSE BUNE"
+    elif scor >= 1:
+        nivel, titlu = "moderat", "FEZABIL, DAR CU RISCURI MODERATE"
+    elif scor >= -1:
+        nivel, titlu = "ridicat", "RISC RIDICAT"
+    else:
+        nivel, titlu = "foarte_ridicat", "RISC FOARTE RIDICAT"
+    return {"scor": scor, "nivel": nivel, "titlu": titlu,
+            "densitate": densitate, "raport_buget": raport_buget}
 
 
-def text_rezerva(rezultat, oras, tip, buget, buget_min, competitori):
-    """Raport simplu, folosit dacă AI-ul nu răspunde."""
-    p1 = (f"Pentru o afacere de tip {tip} în {oras} cu un buget de {buget:.0f} EUR, "
-          f"evaluarea automată este: {rezultat}.")
-    if competitori is not None:
-        p1 += f" Pe hartă au fost găsiți {competitori} competitori similari."
-    p2 = ""
-    if buget_min:
-        if buget >= buget_min:
-            p2 = (f"Bugetul depășește minimul orientativ de {buget_min} EUR, "
-                  f"deci acoperă investiția inițială.")
-        else:
-            p2 = (f"Bugetul este sub minimul orientativ de {buget_min} EUR, "
-                  f"ceea ce crește riscul. Luați în calcul o locație mai mică "
-                  f"sau echipamente second-hand.")
-    return p1 + ("\n\n" + p2 if p2 else "")
-
-
-def genereaza_raport(prompt):
-    """Încearcă Gemini (pe rând, mai multe modele), apoi Groq. Returnează text sau ''."""
-    if GEMINI_API_KEY:
-        for model in MODELE_GEMINI:
+def calculeaza_alocare(alocare_ai, buget):
+    """Normalizează procentele la 100% și calculează sumele în EUR."""
+    randuri = []
+    if isinstance(alocare_ai, list):
+        for x in alocare_ai:
             try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": GEMINI_API_KEY,
-                             "Content-Type": "application/json"},
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"temperature": 0.4,
-                                               "maxOutputTokens": 1200}},
-                    timeout=30,
-                )
-                if r.status_code != 200:
-                    print(f"Gemini {model}: HTTP {r.status_code} {r.text[:200]}")
-                    continue
-                parti = r.json()["candidates"][0]["content"]["parts"]
-                text = "".join(p.get("text", "") for p in parti).strip()
-                if text:
-                    return text
-            except Exception as e:
-                print(f"Gemini {model} eroare: {e}")
-    if client is not None:
+                randuri.append((str(x["categorie"]), float(x["procent"]),
+                                str(x.get("detalii", ""))))
+            except (KeyError, TypeError, ValueError):
+                randuri = []
+                break
+    if not randuri or sum(r[1] for r in randuri) <= 0:
+        randuri = [(c, float(p), d) for c, p, d in ALOCARE_IMPLICITA]
+    total = sum(r[1] for r in randuri)
+    return [{"categorie": c, "procent": round(p * 100 / total, 1),
+             "suma": int(round(buget * p / total)), "detalii": d}
+            for c, p, d in randuri]
+
+
+# ------------------------------------------------------------------- raport AI
+def lista_text(items):
+    return [str(i).strip() for i in items if str(i).strip()] if isinstance(items, list) else []
+
+
+def valideaza_raport(r):
+    if not isinstance(r, dict):
+        return None
+    out = {
+        "rezumat": str(r.get("rezumat", "")).strip(),
+        "concurenta": str(r.get("concurenta", "")).strip(),
+        "analiza_buget": str(r.get("analiza_buget", "")).strip(),
+        "alocare_buget": r.get("alocare_buget"),
+        "riscuri": lista_text(r.get("riscuri")),
+        "oportunitati": lista_text(r.get("oportunitati")),
+        "plan_actiune": lista_text(r.get("plan_actiune")),
+        "concluzie": str(r.get("concluzie", "")).strip(),
+    }
+    if not out["rezumat"] or not out["concurenta"] or not out["plan_actiune"]:
+        return None
+    return out
+
+
+def parseaza_json(text):
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+SCHEMA_JSON = """{
+  "rezumat": "2-3 propoziții: concluzia generală, nuanțată, fără promisiuni",
+  "concurenta": "1-2 paragrafe: cât de aglomerată e piața, ce înseamnă pentru un nou venit, cum te-ai putea diferenția; menționează pe nume 3-5 competitori din listă, DOAR ce știi din date (nume, adresă, distanță), fără a inventa detalii despre ei",
+  "analiza_buget": "1-2 paragrafe: dacă bugetul acoperă investiția inițială ȘI primele luni de funcționare (chirie, utilități, salarii, stoc), ce sacrificii ar trebui făcute",
+  "alocare_buget": [{"categorie": "...", "procent": 0, "detalii": "..."}],
+  "riscuri": ["4-6 riscuri concrete pentru acest tip de afacere în acest oraș"],
+  "oportunitati": ["3-5 oportunități sau idei de diferențiere"],
+  "plan_actiune": ["6-8 pași concreți, în ordine cronologică, de la validare până la lansare și primele 6 luni"],
+  "concluzie": "un paragraf echilibrat care spune clar că succesul nu poate fi garantat și de ce anume depinde"
+}"""
+
+
+def construieste_prompt(oras, tip, buget, buget_min, sursa, comp, ev):
+    if comp is None:
+        linie_comp = "Numărul de competitori NU a putut fi determinat (nu inventa o cifră)."
+        exemple = "(listă indisponibilă)"
+    else:
+        linie_comp = (f"Pe harta OpenStreetMap au fost găsite {comp['total']} locații similare"
+                      f"{' (limită atinsă, numărul real poate fi mai mare)' if comp['plafonat'] else ''}, "
+                      f"dintre care {comp['fara_nume']} fără nume înregistrat.")
+        if ev["densitate"] is not None:
+            linie_comp += f" Densitate: aprox. {ev['densitate']:.1f} la 10.000 locuitori."
+        rand = []
+        for c in comp["lista"][:12]:
+            parti = [c["nume"]]
+            if c["adresa"]:
+                parti.append(c["adresa"])
+            if c["distanta_km"] is not None:
+                parti.append(f"~{c['distanta_km']} km de centru")
+            rand.append("- " + ", ".join(parti))
+        exemple = "\n".join(rand) or "(niciun competitor cu nume)"
+    linie_min = (f"Buget minim orientativ pentru acest tip de afacere: {buget_min} EUR "
+                 f"(sursa: {sursa}). Raport buget/minim: {ev['raport_buget']:.2f}."
+                 if buget_min else
+                 "Nu există un buget minim de referință pentru acest tip; estimează prudent.")
+    return f"""Ești un consultant de afaceri din România, onest și realist. Evaluezi un proiect de antreprenoriat.
+
+DATE:
+- Oraș: {oras}
+- Tip afacere: {tip}
+- Buget disponibil: {buget:.0f} EUR
+- {linie_min}
+- Concurență: {linie_comp}
+- Competitori găsiți (cei mai apropiați de centru):
+{exemple}
+- Nivel de risc calculat de sistem: {ev['titlu']} (nu îl schimba).
+
+REGULI:
+- Scrie în română, ton profesionist, concret și realist. Nu promite succes și nu spune „garantat".
+- Un buget suficient pentru deschidere NU garantează succesul; explică ce mai contează (locație, calitate, marketing, fluxul de numerar, experiența proprietarului).
+- Nu inventa statistici exacte, prețuri sau date despre competitori; folosește formulări ca „estimativ" sau „de obicei".
+- alocare_buget: 6-8 categorii, procentele însumează 100, adaptate tipului de afacere și bugetului.
+- Răspunde STRICT cu un obiect JSON valid, fără text în afara lui, cu exact această structură:
+{SCHEMA_JSON}"""
+
+
+def apel_gemini(model, prompt, timeout):
+    """Returnează (text, eroare)."""
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.5, "maxOutputTokens": 6000,
+                                       "responseMimeType": "application/json"}},
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code} {r.text[:140]}".replace("\n", " ")
+        try:
+            parti = r.json()["candidates"][0]["content"]["parts"]
+        except Exception:
+            return None, "răspuns gol sau blocat"
+        text = "".join(p.get("text", "") for p in parti if not p.get("thought")).strip()
+        return (text, None) if text else (None, "text gol")
+    except Exception as e:
+        return None, str(e)[:140]
+
+
+def modele_descoperite():
+    """Modele flash disponibile pentru cheia ta (dacă numele fixe au fost retrase)."""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": GEMINI_API_KEY},
+                         params={"pageSize": 200}, timeout=8)
+        r.raise_for_status()
+        out = []
+        for m in r.json().get("models", []):
+            nume = m.get("name", "").replace("models/", "")
+            if ("generateContent" in m.get("supportedGenerationMethods", [])
+                    and "flash" in nume
+                    and not any(x in nume for x in ("image", "tts", "live", "audio",
+                                                     "embedding", "robotics", "computer"))):
+                out.append(nume)
+        return sorted(out, reverse=True)
+    except Exception as e:
+        print(f"Descoperire modele: {e}")
+        return []
+
+
+def genereaza_raport(prompt, deadline):
+    """Returnează (raport_validat | None, diagnostic)."""
+    erori = []
+    if GEMINI_API_KEY:
+        incercate = []
+        candidati = list(MODELE_GEMINI)
+        descoperite_folosite = False
+        while candidati:
+            model = candidati.pop(0)
+            if model in incercate:
+                continue
+            incercate.append(model)
+            ramas = deadline - time.time()
+            if ramas < 6:
+                erori.append("timp insuficient")
+                break
+            text, eroare = apel_gemini(model, prompt, min(40, ramas))
+            if text:
+                raport = valideaza_raport(parseaza_json(text))
+                if raport:
+                    return raport, ""
+                eroare = "JSON invalid"
+            erori.append(f"{model}: {eroare}")
+            if not candidati and not descoperite_folosite:
+                descoperite_folosite = True
+                candidati = [m for m in modele_descoperite() if m not in incercate][:2]
+    if client is not None and deadline - time.time() > 6:
         try:
             c = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.4, max_tokens=700, timeout=30)
-            return c.choices[0].message.content.strip()
+                model="llama-3.3-70b-versatile", temperature=0.5, max_tokens=3000,
+                response_format={"type": "json_object"}, timeout=30)
+            raport = valideaza_raport(parseaza_json(c.choices[0].message.content))
+            if raport:
+                return raport, ""
+            erori.append("groq: JSON invalid")
         except Exception as e:
-            print(f"Eroare Groq: {e}")
-    return ""
+            erori.append(f"groq: {str(e)[:100]}")
+    return None, " | ".join(erori) or "nicio cheie AI configurată"
+
+
+def raport_rezerva(ev, oras, tip, buget, buget_min, comp):
+    """Raport de bază, folosit doar dacă AI-ul nu răspunde."""
+    if comp is None:
+        conc = ("Numărul de competitori nu a putut fi determinat automat acum. "
+                f"Verificați manual pe Google Maps câte locații de tip „{tip}” există în {oras}, "
+                "vizitați-le și notați prețurile, programul și gradul de aglomerare.")
+    else:
+        conc = f"Pe harta OpenStreetMap apar {comp['total']} locații similare în {oras}."
+        if ev["densitate"] is not None:
+            conc += f" Asta înseamnă aproximativ {ev['densitate']:.1f} la 10.000 de locuitori."
+        nume = [c["nume"] for c in comp["lista"][:5]]
+        if nume:
+            conc += " Printre cei mai apropiați de centru: " + ", ".join(nume) + "."
+    if buget_min:
+        if buget >= buget_min:
+            ab = (f"Bugetul de {buget:.0f} EUR depășește minimul orientativ de {buget_min} EUR, "
+                  "deci poate acoperi investiția inițială. Păstrați însă o rezervă pentru "
+                  "primele luni, când încasările sunt de obicei sub cheltuieli.")
+        else:
+            ab = (f"Bugetul de {buget:.0f} EUR este sub minimul orientativ de {buget_min} EUR. "
+                  "Ar trebui un spațiu mai mic, echipamente second-hand sau lansare în etape.")
+    else:
+        ab = ("Nu avem un buget de referință pentru acest tip de afacere. "
+              "Cereți oferte reale pentru spațiu, echipamente și autorizări.")
+    return {
+        "rezumat": (f"Pentru {tip} în {oras} cu {buget:.0f} EUR, nivelul estimat este: "
+                    f"{ev['titlu'].lower()}. Rezultatul este orientativ, nu o garanție."),
+        "concurenta": conc,
+        "analiza_buget": ab,
+        "alocare_buget": None,
+        "riscuri": ["Încasări sub așteptări în primele luni",
+                    "Chirie și utilități mari față de venituri",
+                    "Concurență deja stabilită în zonă",
+                    "Dependența de o singură locație și de proprietar"],
+        "oportunitati": ["Diferențiere prin calitate, servicii sau specializare",
+                         "Comunitate online locală și recenzii bune",
+                         "Parteneriate cu afaceri din zonă"],
+        "plan_actiune": ["Vizitați și analizați competitorii din zonă",
+                         "Alegeți locația după trafic pedestru și chirie",
+                         "Cereți oferte reale pentru echipamente și amenajare",
+                         "Faceți un plan financiar cu 3 scenarii (optimist, realist, pesimist)",
+                         "Obțineți avizele și înființați firma",
+                         "Pregătiți lansarea (rețele sociale, promoții)",
+                         "Urmăriți lunar încasările și ajustați oferta"],
+        "concluzie": ("Un buget suficient permite deschiderea, dar nu garantează succesul. "
+                      "Depinde mult de locație, execuție, constanță și de felul în care vă "
+                      "diferențiați de ceilalți."),
+    }
 
 
 # ---------------------------------------------------------------------- rute
-@app.route('/')
-def health():
-    return jsonify({
-        'status': 'ok',
-        'cariere_incarcate': df_cariere is not None,
-        'gemini_configurat': GEMINI_API_KEY is not None,
-        'groq_configurat': client is not None,
-    })
-
-
 @app.route('/predict-cariera', methods=['POST'])
 def predict_cariera():
     if df_cariere is None:
@@ -312,8 +630,45 @@ def predict_cariera():
         return jsonify({'error': f'Valoare invalidă în CSV: {e}'}), 500
 
 
+@app.route('/')
+def health():
+    return jsonify({
+        'status': 'ok',
+        'cariere_incarcate': df_cariere is not None,
+        'gemini_configurat': GEMINI_API_KEY is not None,
+        'groq_configurat': client is not None,
+    })
+
+
+@app.route('/test-ai')
+def test_ai():
+    """Deschide /test-ai în browser ca să vezi de ce nu răspunde Gemini."""
+    if not GEMINI_API_KEY:
+        return jsonify({'error': 'GEMINI_API_KEY nu este setată.'}), 400
+    rez = {}
+    for model in MODELE_GEMINI:
+        text, eroare = apel_gemini(model, 'Răspunde cu JSON: {"ok": true}', 15)
+        rez[model] = "OK" if text else eroare
+    rez["_modele_disponibile_pentru_cheia_ta"] = modele_descoperite()
+    return jsonify(rez)
+
+
+@app.route('/test-harta')
+def test_harta():
+    """Ex: /test-harta?oras=Bacău&tip=cafenea"""
+    oras = request.args.get('oras', 'Bacău')
+    cheie = detecteaza_tip(request.args.get('tip', 'cafenea'))
+    geo = geocodeaza_oras(oras)
+    comp = gaseste_competitori(oras, cheie, geo, time.time() + 25)
+    return jsonify({'tip_detectat': cheie, 'geocodare': geo,
+                    'competitori': comp and {'total': comp['total'],
+                                             'fara_nume': comp['fara_nume'],
+                                             'primii_5': comp['lista'][:5]}})
+
+
 @app.route('/predict', methods=['POST'])
 def analizeaza_business_live():
+    start = time.time()
     data = citeste_date()
     try:
         buget = float(data.get('buget', 0))
@@ -327,53 +682,44 @@ def analizeaza_business_live():
 
     cheie = detecteaza_tip(tip_afacere)
     buget_min, nume_oficial, sursa = buget_minim_pentru(cheie)
-    competitori = numara_competitori_live(oras, cheie)
-    rezultat, scor = evalueaza(buget, buget_min, competitori)
 
-    raport = ""
+    geo = geocodeaza_oras(oras) if cheie else None
+    comp = gaseste_competitori(oras, cheie, geo, start + 28)
+    total = comp["total"] if comp else None
+    populatie = geo["populatie"] if geo else None
+    ev = evalueaza(buget, buget_min, total, populatie)
+
+    raport, diag = None, ""
     if GEMINI_API_KEY or client is not None:
-        linie_comp = (f"{competitori} competitori similari găsiți pe harta OpenStreetMap"
-                      if competitori is not None
-                      else "numărul de competitori nu a putut fi determinat")
-        linie_min = (f"Bugetul minim orientativ pentru acest tip de afacere este "
-                     f"{buget_min} EUR (sursa: {sursa})."
-                     if buget_min else
-                     "Nu există un buget minim de referință; estimează-l tu prudent.")
-        prompt = f"""
-Ești un expert în analiză de piață și fezabilitate financiară din România.
-
-DATE:
-- Oraș: {oras}
-- Tip afacere: {tip_afacere}
-- Buget disponibil: {buget:.0f} EUR
-- Competitori: {linie_comp}
-- {linie_min}
-
-VERDICTUL a fost deja calculat de sistem: {rezultat}. Nu îl schimba.
-
-SARCINĂ: scrie în română un raport de 2-3 paragrafe scurte, FĂRĂ titlu și fără
-a repeta cuvântul „verdict":
-1. Menționează numărul de competitori din {oras} (dacă îl cunoști) și ce
-   înseamnă pentru concurență.
-2. Explică dacă bugetul de {buget:.0f} EUR este suficient (chirie, echipamente,
-   autorizări, promovare) și justifică verdictul {rezultat}.
-3. Încheie cu o recomandare strategică concretă și realistă.
-Nu inventa cifre exacte pe care nu le ai.
-"""
-        raport = genereaza_raport(prompt)
-    ai_ok = bool(raport)
-
+        prompt = construieste_prompt(oras, tip_afacere, buget, buget_min, sursa, comp, ev)
+        raport, diag = genereaza_raport(prompt, start + 52)
+    ai_ok = raport is not None
     if not ai_ok:
-        raport = text_rezerva(rezultat, oras, tip_afacere, buget, buget_min, competitori)
+        raport = raport_rezerva(ev, oras, tip_afacere, buget, buget_min, comp)
+
+    alocare = calculeaza_alocare(raport.get("alocare_buget"), buget)
+    raport.pop("alocare_buget", None)
 
     return jsonify({
-        'rezultat': rezultat,
-        'explicatie': raport,
-        'competitori_gasiti': competitori,
+        'rezultat': ev['titlu'],
+        'nivel': ev['nivel'],
+        'scor': ev['scor'],
         'oras': oras,
-        'buget_minim': buget_min,
         'tip_detectat': nume_oficial or tip_afacere,
+        'buget': buget,
+        'buget_minim': buget_min,
+        'raport_buget': round(ev['raport_buget'], 2) if ev['raport_buget'] else None,
+        'competitori_gasiti': total,
+        'competitori_lista': comp["lista"] if comp else [],
+        'competitori_fara_nume': comp["fara_nume"] if comp else 0,
+        'competitori_plafonat': bool(comp and comp["plafonat"]),
+        'densitate_la_10k': round(ev['densitate'], 1) if ev['densitate'] is not None else None,
+        'populatie': populatie,
+        'raport': raport,
+        'alocare_buget': alocare,
         'raport_ai': ai_ok,
+        'ai_diagnostic': "" if ai_ok else diag,
+        'disclaimer': DISCLAIMER,
     })
 
 
