@@ -4,7 +4,7 @@
     {
       "src": "index.py",
       "use": "@vercel/python",
-      "config": { "includeFiles": ["baza_cariere.csv", "surse_piata.json"] }
+      "config": { "includeFiles": ["baza_cariere.csv", "surse_piata.json"], "maxDuration": 60 }
     }
   ],
   "routes": [
