@@ -43,6 +43,54 @@ CATEGORII = ['REALIST', 'INVESTIGATIV', 'ARTISTIC',
 
 
 # ------------------------------------------------------------- încărcare date
+LITERE = {"REALIST": "R", "INVESTIGATIV": "I", "ARTISTIC": "A",
+          "SOCIAL": "S", "INTREPRINZATOR": "E", "CONVENTIONAL": "C"}
+NUME_LITERA = {v: k for k, v in LITERE.items()}
+ORDINE = "RIASEC"
+NUME_AFISAT = {"R": "Realist", "I": "Investigativ", "A": "Artistic",
+               "S": "Social", "E": "Întreprinzător", "C": "Convențional"}
+DESCRIERI = {
+    "R": "Îți place munca practică: unelte, mașini, natură, construit și reparat lucruri concrete.",
+    "I": "Te atrage înțelegerea lucrurilor: cercetare, analiză, știință, probleme logice complexe.",
+    "A": "Ai nevoie de creativitate și libertate de exprimare: artă, scris, design, muzică, idei originale.",
+    "S": "Te motivează oamenii: să ajuți, să înveți, să îngrijești și să lucrezi în echipă.",
+    "E": "Îți place să conduci, să convingi și să iei inițiativa: afaceri, vânzări, proiecte, influență.",
+    "C": "Preferi ordinea și precizia: organizare, cifre, proceduri clare, lucrul bine structurat.",
+}
+
+
+def curata_cariere(df):
+    """Unește rândurile de continuare (pașii 2, 3, 4...) cu cariera lor și normalizează datele."""
+    if "id_cariera" not in df.columns or "cod_psihologic" not in df.columns:
+        return df
+    df = df.copy()
+    df["_g"] = df["id_cariera"].notna().cumsum()
+    df = df[df["_g"] > 0]
+    fixe = [c for c in ("id_cariera", "cod_psihologic", "salariu_mediu", "cod_holland")
+            if c in df.columns]
+    text = [c for c in df.columns if c not in fixe and c != "_g"]
+
+    def lipeste(serie):
+        return "\n".join(str(x).strip() for x in serie.dropna() if str(x).strip())
+
+    agg = {c: "first" for c in fixe}
+    agg.update({c: lipeste for c in text})
+    out = df.groupby("_g", sort=True).agg(agg).reset_index(drop=True)
+
+    out["id_cariera"] = out["id_cariera"].astype(float).astype(int)
+    out["cod_psihologic"] = out["cod_psihologic"].astype(str).str.strip().str.upper()
+    out["salariu_mediu"] = pd.to_numeric(out.get("salariu_mediu"), errors="coerce")
+
+    def cod3(rand):
+        prim = LITERE.get(rand["cod_psihologic"], "")
+        brut = rand.get("cod_holland")
+        brut = re.sub(r"[^RIASEC]", "", str(brut).upper()) if isinstance(brut, str) else ""
+        brut = "".join(dict.fromkeys(brut))[:3]
+        return brut or prim
+    out["cod_holland"] = out.apply(cod3, axis=1)
+    return out
+
+
 def incarca_csv():
     for enc in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
         try:
@@ -56,13 +104,8 @@ def incarca_csv():
                 if baza != c:
                     redenumiri[c] = baza
             df = df.rename(columns=redenumiri)
-            # elimină rândurile goale
-            df = df.dropna(subset=["id_cariera", "cod_psihologic"])
-            if "cod_psihologic" in df.columns:
-                df["cod_psihologic"] = (
-                    df["cod_psihologic"].astype(str).str.strip().str.upper()
-                )
-            print(f"baza_cariere.csv incarcat (encoding: {enc}).")
+            df = curata_cariere(df)
+            print(f"baza_cariere.csv incarcat (encoding: {enc}), {len(df)} cariere.")
             return df
         except FileNotFoundError:
             print(f"Fisierul {CSV_PATH} nu exista.")
@@ -712,6 +755,66 @@ def raport_rezerva(ev, oras, tip, buget, buget_min, comp):
 
 
 # ---------------------------------------------------------------------- rute
+def cod_utilizator(punctaje):
+    """Primele 3 categorii ale utilizatorului, ca literă (ex. 'SAI')."""
+    ordonat = sorted(ORDINE, key=lambda l: (-punctaje[NUME_LITERA[l]], ORDINE.index(l)))
+    return "".join(l for l in ordonat[:3] if punctaje[NUME_LITERA[l]] > 0)
+
+
+def vector_cariera(cod):
+    v = [0, 0, 0, 0, 0, 0]
+    for poz, l in enumerate(cod[:3]):
+        v[ORDINE.index(l)] = 3 - poz  # prima literă contează cel mai mult
+    return v
+
+
+def corelatie(a, b):
+    """Corelația Pearson dintre profilul utilizatorului și cel al meseriei (-1..1)."""
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = math.sqrt(sum((x - ma) ** 2 for x in a))
+    db = math.sqrt(sum((y - mb) ** 2 for y in b))
+    return num / (da * db) if da and db else 0.0
+
+
+def clasament_cariere(df, punctaje, limita=8):
+    u = [punctaje[NUME_LITERA[l]] for l in ORDINE]
+    cod_u = cod_utilizator(punctaje)
+    rez = []
+    for _, rand in df.iterrows():
+        cod = rand["cod_holland"]
+        potrivire = max(0.0, corelatie(u, vector_cariera(cod))) * 100
+        comun = [NUME_AFISAT[l] for l in cod if l in cod_u]
+        forta = sum((3 - poz) * punctaje[NUME_LITERA[l]] for poz, l in enumerate(cod[:3]))
+        rez.append((potrivire, forta, rand, comun))
+    rez.sort(key=lambda x: (-round(x[0], 6), -x[1], int(x[2]["id_cariera"])))
+    rez = [(p, r, c) for p, _, r, c in rez]
+    return rez[:limita]
+
+
+def text_curat(rand, camp):
+    v = rand.get(camp, "")
+    return "" if pd.isna(v) else str(v)
+
+
+def cariera_json(potrivire, rand, comun):
+    sal = rand.get("salariu_mediu")
+    return {
+        'id_cariera': int(rand['id_cariera']),
+        'titlu_job': text_curat(rand, 'titlu_job'),
+        'cod_holland': rand['cod_holland'],
+        'potrivire': int(round(potrivire)),
+        'potrivit_pe': comun,
+        'facultate_ro': text_curat(rand, 'facultate_ro'),
+        'admitere_ro': text_curat(rand, 'admitere_ro'),
+        'facultate_strainatate': text_curat(rand, 'facultate_strainatate'),
+        'admitere_strainatate': text_curat(rand, 'admitere_strainatate'),
+        'pas_practic': text_curat(rand, 'pas_practic'),
+        'salariu_mediu': None if pd.isna(sal) else int(sal),
+    }
+
+
 @app.route('/predict-cariera', methods=['POST'])
 def predict_cariera():
     if df_cariere is None:
@@ -722,32 +825,46 @@ def predict_cariera():
     if scor_maxim == 0:
         return jsonify({'error': 'Nu s-au primit răspunsuri valide din test.'}), 400
 
-    profil = max(punctaje, key=punctaje.get)
-    potrivite = df_cariere[df_cariere['cod_psihologic'] == profil]
-    if potrivite.empty:
-        return jsonify({'error': f'Nu există cariere pentru profilul {profil}'}), 404
+    if len(set(punctaje.values())) == 1:
+        return jsonify({'error': 'Ai dat același scor tuturor categoriilor, deci profilul nu se poate '
+                                 'stabili. Reia testul și alege mai selectiv.'}), 400
 
-    cariera = potrivite.iloc[scor_maxim % len(potrivite)]
     try:
-        return jsonify({
-            'status': 'success',
-            'id_cariera': int(cariera['id_cariera']),
-            'profil_detectat': profil,
-            'punctaje': punctaje,
-            'descriere_profil': str(cariera.get('descriere_profil', '')),
-            'punctaj_obtinut': scor_maxim,
-            'titlu_job': str(cariera['titlu_job']),
-            'facultate_ro': str(cariera['facultate_ro']),
-            'admitere_ro': str(cariera['admitere_ro']),
-            'facultate_strainatate': str(cariera['facultate_strainatate']),
-            'admitere_strainatate': str(cariera['admitere_strainatate']),
-            'pas_practic': str(cariera['pas_practic']),
-            'salariu_mediu': int(cariera['salariu_mediu']),
-        })
-    except KeyError as e:
-        return jsonify({'error': f'Coloana {e} lipsește din baza_cariere.csv'}), 500
-    except (TypeError, ValueError) as e:
-        return jsonify({'error': f'Valoare invalidă în CSV: {e}'}), 500
+        cod_u = cod_utilizator(punctaje)
+        clasament = clasament_cariere(df_cariere, punctaje)
+        top = [cariera_json(p, r, c) for p, r, c in clasament]
+    except Exception as e:
+        print(f"Eroare clasament cariere: {e}")
+        return jsonify({'error': f'Eroare la calcularea potrivirilor: {e}'}), 500
+
+    profil = max(punctaje, key=punctaje.get)
+    total = sum(punctaje.values()) or 1
+    litere_profil = [NUME_AFISAT[l] for l in cod_u]
+    descriere = (f"Profilul tău Holland este {cod_u} ({', '.join(litere_profil)}). "
+                 f"{DESCRIERI[cod_u[0]]}")
+    if len(cod_u) > 1:
+        descriere += (f" Pe locul doi, {litere_profil[1].lower()}: "
+                      f"{DESCRIERI[cod_u[1]][0].lower() + DESCRIERI[cod_u[1]][1:]}")
+
+    rezultat = {
+        'status': 'success',
+        'cod_holland': cod_u,
+        'profil_detectat': profil,
+        'profil_complet': [NUME_LITERA[l] for l in cod_u],
+        'punctaje': punctaje,
+        'punctaje_procente': {k: round(v * 100 / total) for k, v in punctaje.items()},
+        'descriere_profil': descriere,
+        'punctaj_obtinut': scor_maxim,
+        'cariere_in_baza': int(len(df_cariere)),
+        'top_cariere': top,
+        'avertisment': ("Testul orientează, nu hotărăște: folosește rezultatele ca punct de plecare "
+                        "și verifică ofertele concrete ale facultăților și angajatorilor."),
+    }
+    # câmpurile vechi (cariera cea mai potrivită), pentru compatibilitate cu pagina existentă
+    rezultat.update(top[0])
+    rezultat['cod_holland_cariera'] = rezultat['cod_holland']
+    rezultat['cod_holland'] = cod_u
+    return jsonify(rezultat)
 
 
 @app.route('/')
@@ -755,6 +872,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'cariere_incarcate': df_cariere is not None,
+        'numar_cariere': int(len(df_cariere)) if df_cariere is not None else 0,
         'gemini_configurat': GEMINI_API_KEY is not None,
         'google_maps_configurat': GOOGLE_API_KEY is not None,
         'groq_configurat': client is not None,
