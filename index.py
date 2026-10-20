@@ -272,7 +272,7 @@ def proceseaza_elemente(elements, centru):
         lista.sort(key=lambda x: (x["distanta_km"] is None, x["distanta_km"] or 0))
     else:
         lista.sort(key=lambda x: x["nume"].lower())
-    return {"total": total, "fara_nume": fara_nume, "lista": lista[:20],
+    return {"total": total, "fara_nume": fara_nume, "lista": lista[:40],
             "plafonat": len(elements) >= LIMITA_ELEMENTE, "sursa": "OpenStreetMap"}
 
 
@@ -387,7 +387,7 @@ def gaseste_competitori_google(oras, tip_afacere, cheie, geo, deadline):
         })
     if centru:
         lista.sort(key=lambda x: (x["distanta_km"] is None, x["distanta_km"] or 0))
-    return {"total": len(lista), "fara_nume": 0, "lista": lista[:20],
+    return {"total": len(lista), "fara_nume": 0, "lista": lista[:40],
             "plafonat": len(locuri) >= 20 * PAGINI_GOOGLE and bool(token),
             "sursa": "Google Maps"}, ""
 
