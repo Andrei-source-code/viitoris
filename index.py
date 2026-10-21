@@ -168,7 +168,10 @@ OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
 ]
+CACHE_COMPETITORI = {}      # (oras, tip) -> (moment, rezultat); ține câteva ore
+TTL_CACHE = 6 * 3600
 LIMITA_ELEMENTE = 2000
 
 DISCLAIMER = ("Analiza este orientativă și NU garantează succesul afacerii. "
@@ -260,20 +263,30 @@ def geocodeaza_oras(oras):
 
 
 def ruleaza_overpass(query, deadline):
+    """Returnează (elemente | None, lista de erori pe server)."""
+    erori = []
     for url in OVERPASS_URLS:
+        gazda = url.split("/")[2]
         ramas = deadline - time.time()
-        if ramas < 4:
+        if ramas < 3:
+            erori.append(f"{gazda}: timp insuficient")
             break
         try:
             r = requests.post(url, data={"data": query},
-                              headers={"User-Agent": UA}, timeout=min(14, ramas))
+                              headers={"User-Agent": UA}, timeout=min(8, ramas))
             if r.status_code != 200:
-                print(f"Overpass {url}: HTTP {r.status_code}")
+                erori.append(f"{gazda}: HTTP {r.status_code}")
                 continue
-            return r.json().get("elements", [])
+            js = r.json()
+            elemente = js.get("elements", [])
+            remarca = str(js.get("remark", ""))
+            if not elemente and ("error" in remarca.lower() or "timed out" in remarca.lower()):
+                erori.append(f"{gazda}: {remarca[:70]}")
+                continue
+            return elemente, erori
         except Exception as e:
-            print(f"Overpass {url}: {e}")
-    return None
+            erori.append(f"{gazda}: {str(e)[:60]}")
+    return None, erori
 
 
 def distanta_km(lat1, lon1, lat2, lon2):
@@ -322,7 +335,7 @@ def proceseaza_elemente(elements, centru):
 def gaseste_competitori(oras, cheie, geo, deadline):
     """Returnează dict cu total + listă, sau None dacă harta nu a răspuns."""
     if not cheie:
-        return None
+        return None, ["tip necunoscut"]
     uniune = "\n".join(f"nwr{f}{{FILTRU_ZONA}};" for f in TIPURI[cheie][1])
     if geo:
         s, w, n, e = geo["bbox"]
@@ -337,10 +350,10 @@ def gaseste_competitori(oras, cheie, geo, deadline):
                  f"{uniune.replace('{FILTRU_ZONA}', '(area.a)')}\n);\n"
                  f"out center tags {LIMITA_ELEMENTE};")
         centru = None
-    elemente = ruleaza_overpass(query, deadline)
+    elemente, erori = ruleaza_overpass(query, deadline)
     if elemente is None:
-        return None
-    return proceseaza_elemente(elemente, centru)
+        return None, erori
+    return proceseaza_elemente(elemente, centru), erori
 
 
 # ---------------------------------------------------------- Google Maps (Places)
@@ -435,17 +448,76 @@ def gaseste_competitori_google(oras, tip_afacere, cheie, geo, deadline):
             "sursa": "Google Maps"}, ""
 
 
+# ----------------------------------------- rezervă: căutare de locuri în Nominatim
+TERMENI_NOMINATIM = {
+    "cafenea": "cafe", "restaurant": "restaurant", "salon": "hairdresser",
+    "patiserie": "bakery", "fitness": "fitness centre", "bar": "bar",
+    "stomatologie": "dentist", "farmacie": "pharmacy", "service_auto": "car repair",
+}
+
+
+def gaseste_competitori_nominatim(tip_afacere, cheie, geo, deadline):
+    """Rezervă când Overpass nu răspunde. Returnează (dict | None, eroare)."""
+    if not geo:
+        return None, "zona orașului nu a putut fi determinată"
+    time.sleep(1.1)  # politica Nominatim: maximum 1 cerere pe secundă
+    ramas = deadline - time.time()
+    if ramas < 3:
+        return None, "timp insuficient"
+    s_, w, n, e = geo["bbox"][0], geo["bbox"][1], geo["bbox"][2], geo["bbox"][3]
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": TERMENI_NOMINATIM.get(cheie, tip_afacere), "format": "jsonv2",
+                    "limit": 40, "viewbox": f"{w},{n},{e},{s_}", "bounded": 1,
+                    "addressdetails": 1, "accept-language": "ro"},
+            headers={"User-Agent": UA}, timeout=min(10, ramas))
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        rezultate = r.json()
+    except Exception as ex:
+        return None, str(ex)[:80]
+    elemente = []
+    for x in rezultate:
+        try:
+            adr = x.get("address") or {}
+            elemente.append({"lat": float(x["lat"]), "lon": float(x["lon"]), "tags": {
+                "name": x.get("name") or "",
+                "addr:street": adr.get("road", ""),
+                "addr:housenumber": adr.get("house_number", "")}})
+        except (KeyError, TypeError, ValueError):
+            continue
+    comp = proceseaza_elemente(elemente, (geo["lat"], geo["lon"]))
+    comp["plafonat"] = len(rezultate) >= 40
+    return comp, ""
+
+
 def gaseste_competitori_automat(oras, tip_afacere, cheie, geo, deadline):
-    """Google Maps întâi, apoi OpenStreetMap ca rezervă. Returnează (comp, diagnostic)."""
+    """Cache -> Google Maps -> OpenStreetMap -> cache vechi. Returnează (comp, diagnostic)."""
+    cheie_cache = (oras.lower().strip(), cheie or tip_afacere.lower().strip())
+    in_cache = CACHE_COMPETITORI.get(cheie_cache)
+    if in_cache and time.time() - in_cache[0] < TTL_CACHE:
+        return in_cache[1], "din memorie (rezultat recent)"
+
     diag = []
     comp, eroare = gaseste_competitori_google(oras, tip_afacere, cheie, geo, deadline)
-    if comp is not None:
-        return comp, ""
-    diag.append(f"google: {eroare}")
-    comp = gaseste_competitori(oras, cheie, geo, deadline)
     if comp is None:
-        diag.append("osm: fără răspuns" if cheie else "osm: tip necunoscut")
-    return comp, " | ".join(diag)
+        diag.append(f"google: {eroare}")
+        comp, erori_osm = gaseste_competitori(oras, cheie, geo, min(deadline, time.time() + 16))
+        if comp is None:
+            diag.append("overpass: " + "; ".join(erori_osm))
+            comp, eroare_n = gaseste_competitori_nominatim(tip_afacere, cheie, geo, deadline)
+            if comp is None:
+                diag.append("nominatim: " + eroare_n)
+            else:
+                diag.append("lista obținută prin Nominatim")
+    if comp is not None:
+        CACHE_COMPETITORI[cheie_cache] = (time.time(), comp)
+        return comp, " | ".join(diag)
+    if in_cache:  # sursele nu răspund, dar avem un rezultat mai vechi
+        diag.append("folosit rezultat mai vechi din memorie")
+        return in_cache[1], " | ".join(diag)
+    return None, " | ".join(diag)
 
 
 # ---------------------------------------------------------------- evaluare
