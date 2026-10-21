@@ -1034,4 +1034,17 @@ def analizeaza_business_live():
         'competitori_gasiti': total,
         'competitori_lista': comp["lista"] if comp else [],
         'competitori_fara_nume': comp["fara_nume"] if comp else 0,
-        'competitori_plafonat': bool(comp and comp["
+        'competitori_plafonat': bool(comp and comp["plafonat"]),
+        'densitate_la_10k': round(ev['densitate'], 1) if ev['densitate'] is not None else None,
+        'populatie': populatie,
+        'raport': raport,
+        'alocare_buget': alocare,
+        'raport_ai': ai_ok,
+        'ai_diagnostic': "" if ai_ok else diag,
+        'disclaimer': DISCLAIMER,
+    })
+
+
+# Doar pentru rulare locală
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
