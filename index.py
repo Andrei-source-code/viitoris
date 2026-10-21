@@ -758,6 +758,9 @@ def genereaza_raport(prompt, deadline):
                     return raport, ""
                 eroare = "JSON invalid"
             erori.append(f"{model}: {eroare}")
+            if eroare and ("HTTP 403" in eroare or "HTTP 401" in eroare or "API_KEY_INVALID" in eroare):
+                erori.append("cheia/proiectul Gemini nu are acces; celelalte modele nu se mai încearcă")
+                break
             if not candidati and not descoperite_folosite:
                 descoperite_folosite = True
                 candidati = [m for m in modele_descoperite() if m not in incercate][:2]
@@ -765,7 +768,7 @@ def genereaza_raport(prompt, deadline):
         try:
             c = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile", temperature=0.5, max_tokens=3000,
+                model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"), temperature=0.5, max_tokens=3000,
                 response_format={"type": "json_object"}, timeout=30)
             raport = valideaza_raport(parseaza_json(c.choices[0].message.content))
             if raport:
@@ -961,6 +964,9 @@ def test_ai():
         text, eroare = apel_gemini(model, 'Răspunde cu JSON: {"ok": true}', 15)
         rez[model] = "OK" if text else eroare
     rez["_modele_disponibile_pentru_cheia_ta"] = modele_descoperite()
+    # ultimele 4 caractere, ca să poți verifica în AI Studio că rulează cheia nouă
+    rez["_cheia_gemini_se_termina_in"] = GEMINI_API_KEY[-4:]
+    rez["_groq_configurat"] = client is not None
     return jsonify(rez)
 
 
@@ -1028,17 +1034,4 @@ def analizeaza_business_live():
         'competitori_gasiti': total,
         'competitori_lista': comp["lista"] if comp else [],
         'competitori_fara_nume': comp["fara_nume"] if comp else 0,
-        'competitori_plafonat': bool(comp and comp["plafonat"]),
-        'densitate_la_10k': round(ev['densitate'], 1) if ev['densitate'] is not None else None,
-        'populatie': populatie,
-        'raport': raport,
-        'alocare_buget': alocare,
-        'raport_ai': ai_ok,
-        'ai_diagnostic': "" if ai_ok else diag,
-        'disclaimer': DISCLAIMER,
-    })
-
-
-# Doar pentru rulare locală
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
+        'competitori_plafonat': bool(comp and comp["
