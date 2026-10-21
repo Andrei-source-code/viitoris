@@ -16,8 +16,8 @@ CORS(app)
 # ---------------------------------------------------------------- configurare
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # Poți fixa modelul din Vercel (variabila GEMINI_MODEL); altfel se încearcă pe rând
-MODELE_GEMINI = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-flash-latest",
-                             "gemini-2.5-flash", "gemini-3.5-flash"] if m]
+MODELE_GEMINI = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-flash-lite-latest",
+                             "gemini-flash-latest", "gemini-3.5-flash"] if m]
 
 # Google Maps (Places API New) - sursa principală pentru competitori
 GOOGLE_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
@@ -173,6 +173,10 @@ OVERPASS_URLS = [
 CACHE_COMPETITORI = {}      # (oras, tip) -> (moment, rezultat); ține câteva ore
 TTL_CACHE = 6 * 3600
 LIMITA_ELEMENTE = 2000
+# Timpul total al unei analize, în secunde. Trebuie să fie MAI MIC decât maxDuration din vercel.json
+# (60 acolo -> 55 aici). Poți schimba din Vercel prin variabila TIMP_TOTAL_SECUNDE.
+TIMP_TOTAL = int(os.environ.get("TIMP_TOTAL_SECUNDE", "55"))
+REZERVA_GROQ = 10   # secunde păstrate pentru Groq, doar dacă ai GROQ_API_KEY
 
 DISCLAIMER = ("Analiza este orientativă și NU garantează succesul afacerii. "
               "Rezultatul real depinde de locația exactă, de execuție și management, "
@@ -698,7 +702,7 @@ def apel_gemini(model, prompt, timeout):
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.5, "maxOutputTokens": 6000,
+                  "generationConfig": {"temperature": 0.5, "maxOutputTokens": 8000,
                                        "responseMimeType": "application/json"}},
             timeout=timeout,
         )
@@ -747,11 +751,12 @@ def genereaza_raport(prompt, deadline):
             if model in incercate:
                 continue
             incercate.append(model)
-            ramas = deadline - time.time()
-            if ramas < 6:
-                erori.append("timp insuficient")
+            rezerva = REZERVA_GROQ if client is not None else 0   # doar cât să apuce Groq
+            ramas = deadline - time.time() - rezerva
+            if ramas < (6 if not incercate[:-1] else 12):
+                erori.append("timp insuficient pentru Gemini")
                 break
-            text, eroare = apel_gemini(model, prompt, min(40, ramas))
+            text, eroare = apel_gemini(model, prompt, ramas)   # tot timpul rămas
             if text:
                 raport = valideaza_raport(parseaza_json(text))
                 if raport:
@@ -764,12 +769,13 @@ def genereaza_raport(prompt, deadline):
             if not candidati and not descoperite_folosite:
                 descoperite_folosite = True
                 candidati = [m for m in modele_descoperite() if m not in incercate][:2]
-    if client is not None and deadline - time.time() > 6:
+    if client is not None and deadline - time.time() > 4:
         try:
             c = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"), temperature=0.5, max_tokens=3000,
-                response_format={"type": "json_object"}, timeout=30)
+                response_format={"type": "json_object"},
+                timeout=max(5, min(30, deadline - time.time())))
             raport = valideaza_raport(parseaza_json(c.choices[0].message.content))
             if raport:
                 return raport, ""
@@ -1011,7 +1017,7 @@ def analizeaza_business_live():
     raport, diag = None, ""
     if GEMINI_API_KEY or client is not None:
         prompt = construieste_prompt(oras, tip_afacere, buget, buget_min, sursa, comp, ev)
-        raport, diag = genereaza_raport(prompt, start + 52)
+        raport, diag = genereaza_raport(prompt, start + TIMP_TOTAL)
     ai_ok = raport is not None
     if not ai_ok:
         raport = raport_rezerva(ev, oras, tip_afacere, buget, buget_min, comp)
